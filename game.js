@@ -1338,8 +1338,9 @@
     if (typeof Peer === 'undefined') return; // peerjs missing — single player still works
     const params = new URLSearchParams(location.search);
     const joined = (params.get('room') || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
-    let isHost = false;
     const code = joined || Math.random().toString(36).slice(2, 8);
+    let mySlot = -1;
+    const MAX_SLOTS = 8;
     const NAMES_A = ['Trippy', 'Glowy', 'Cosmic', 'Mellow', 'Fuzzy', 'Neon', 'Dreamy', 'Sporey'];
     const NAMES_B = ['Toad', 'Shroom', 'Wisp', 'Jelly', 'Moth', 'Fern', 'Spore', 'Crystal'];
     const myName = (params.get('name') ||
@@ -1347,7 +1348,6 @@
     const myHue = Math.random();
     const meta = new Map();   // id -> {name, hue}
     const conns = new Map();  // id -> DataConnection
-    let hostConn = null;
 
     function updateRoster() {
       const el = document.getElementById('players');
@@ -1357,7 +1357,7 @@
         d.textContent = txt;
         el.appendChild(d);
       };
-      mkRow('⋆ room ' + code + (isHost ? ' (hosting)' : ''));
+      mkRow('⋆ room ' + code + (mySlot >= 0 ? '' : ' — connecting…'));
       mkRow('🍄 ' + myName + ' (you)');
       for (const m of meta.values()) mkRow('🍄 ' + m.name);
     }
@@ -1394,34 +1394,18 @@
       if (m) toast(m.name + ' left');
       updateRoster();
     }
-    function broadcast(except, msg) {
-      for (const [id, c] of conns) if (id !== except && c.open) c.send(msg);
+    function broadcast(msg) {
+      for (const c of conns.values()) if (c.open) c.send(msg);
     }
-    function handleMsg(fromId, msg, viaConn) {
+    function handleMsg(fromId, msg) {
       if (!msg || typeof msg !== 'object') return;
       switch (msg.t) {
         case 'hello':
           addPlayer(fromId, msg.name, msg.hue);
-          viaConn.send({
-            t: 'welcome',
-            players: [{ id: 'H', name: myName, hue: myHue }].concat(
-              [...meta].filter(([id]) => id !== fromId).map(([id, m]) => ({ id, name: m.name, hue: m.hue }))
-            ),
-            orbs: orbs.map(o => o.taken)
-          });
-          broadcast(fromId, { t: 'join', id: fromId, name: msg.name, hue: msg.hue });
-          break;
-        case 'welcome':
-          for (const p of msg.players || []) addPlayer(p.id, p.name, p.hue);
           (msg.orbs || []).forEach((tk, i) => { if (tk) collectOrb(i, true); });
-          toast('connected — explore together ✨');
           break;
-        case 'join': addPlayer(msg.id, msg.name, msg.hue); break;
-        case 'leave': removePlayer(msg.id); break;
         case 'p': {
-          if (isHost) broadcast(fromId, { t: 'p', id: fromId, x: msg.x, y: msg.y, z: msg.z, h: msg.h, a: msg.a });
-          const id = isHost ? fromId : (msg.id || 'H');
-          const av = remotes.get(id);
+          const av = remotes.get(fromId);
           if (av) {
             av.target.set(+msg.x || 0, +msg.y || 0, +msg.z || 0);
             av.targetH = +msg.h || 0;
@@ -1429,89 +1413,74 @@
           }
           break;
         }
-        case 'orb': {
-          const i = msg.i | 0;
-          if (isHost) broadcast(fromId, { t: 'orb', i });
-          collectOrb(i, true);
+        case 'orb':
+          collectOrb(msg.i | 0, true);
           break;
-        }
       }
     }
 
-    // first one into a room claims it as host; everyone after joins them.
+    // full mesh: everyone claims a numbered slot in the room and dials every other slot.
+    // no host, so there is nothing to lose or race — a periodic rescan heals any gaps.
     let peer = null;
 
-    function resetPeer() {
-      if (peer) { try { peer.destroy(); } catch (e) { /* already dead */ } peer = null; }
-    }
-    function cleanupRemotes() {
-      for (const id of [...remotes.keys()]) removePlayer(id);
-      conns.clear();
-      hostConn = null;
-    }
     function handlePeerError(err) {
       if (err.type !== 'peer-unavailable' && err.type !== 'unavailable-id' && err.type !== 'disconnected') {
         toast('network hiccup: ' + err.type);
       }
     }
 
-    function becomeHost() {
-      resetPeer();
-      cleanupRemotes();
-      isHost = true;
-      updateRoster();
-      const p = new Peer('sporelands-' + code, { debug: 0 });
-      peer = p;
-      p.on('open', () => toast('hosting room ' + code + ' — invite a friend!'));
-      p.on('connection', (conn) => {
-        if (peer !== p) return;
-        conn.on('open', () => conns.set(conn.peer, conn));
-        conn.on('data', m => handleMsg(conn.peer, m, conn));
-        conn.on('close', () => {
-          if (peer !== p) return;
-          if (conns.has(conn.peer)) {
-            conns.delete(conn.peer);
-            removePlayer(conn.peer);
-            broadcast(null, { t: 'leave', id: conn.peer });
-          }
-        });
+    function slotId(k) { return 'sporelands-' + code + '-' + k; }
+
+    function wire(pInst, conn, outgoing) {
+      const rid = conn.peer;
+      conn.on('open', () => {
+        if (peer !== pInst) { try { conn.close(); } catch (e) {} return; }
+        const existing = conns.get(rid);
+        if (existing && existing !== conn) {
+          // both sides dialed at once — keep the channel dialed by the lower slot id
+          const keepThis = outgoing ? pInst.id < rid : pInst.id > rid;
+          if (!keepThis) { try { conn.close(); } catch (e) {} return; }
+          try { existing.close(); } catch (e) {}
+        }
+        conns.set(rid, conn);
+        conn.send({ t: 'hello', name: myName, hue: myHue, orbs: orbs.map(o => o.taken) });
       });
-      p.on('error', (err) => {
-        if (peer !== p) return;
-        if (err.type === 'unavailable-id') {
-          // someone else claimed this room first — join them instead
-          tryJoin();
-        } else handlePeerError(err);
+      conn.on('data', (m) => { if (peer === pInst) handleMsg(rid, m); });
+      conn.on('close', () => {
+        if (peer === pInst && conns.get(rid) === conn) {
+          conns.delete(rid);
+          removePlayer(rid);
+        }
       });
     }
 
-    function tryJoin() {
-      resetPeer();
-      cleanupRemotes();
-      isHost = false;
-      updateRoster();
-      const p = new Peer(undefined, { debug: 0 });
+    function dialOthers(pInst) {
+      for (let s = 0; s < MAX_SLOTS; s++) {
+        if (s === mySlot) continue;
+        const rid = slotId(s);
+        if (conns.has(rid)) continue;
+        wire(pInst, pInst.connect(rid), true);
+      }
+    }
+
+    function claimSlot(k) {
+      if (k >= MAX_SLOTS) { toast('room is full (' + MAX_SLOTS + ' players)'); return; }
+      if (peer) { try { peer.destroy(); } catch (e) {} }
+      const p = new Peer(slotId(k), { debug: 0 });
       peer = p;
       p.on('open', () => {
         if (peer !== p) return;
-        const conn = p.connect('sporelands-' + code);
-        hostConn = conn;
-        conn.on('open', () => conn.send({ t: 'hello', name: myName, hue: myHue }));
-        conn.on('data', m => handleMsg('H', m, conn));
-        conn.on('close', () => {
-          if (peer !== p) return;
-          toast('host disconnected — reconnecting…');
-          cleanupRemotes();
-          setTimeout(() => { if (peer === p) tryJoin(); }, 2500);
-        });
+        mySlot = k;
+        updateRoster();
+        toast('room ' + code + ' — connected ✨');
+        dialOthers(p);
       });
+      p.on('connection', (conn) => { if (peer === p) wire(p, conn, false); });
+      p.on('disconnected', () => { if (peer === p) { try { p.reconnect(); } catch (e) {} } });
       p.on('error', (err) => {
         if (peer !== p) return;
-        if (err.type === 'peer-unavailable') {
-          // nobody hosting this room right now — claim it
-          toast('room was empty — you are hosting it now');
-          becomeHost();
-        } else handlePeerError(err);
+        if (err.type === 'unavailable-id') claimSlot(k + 1); // slot taken, try the next
+        else handlePeerError(err);
       });
     }
 
@@ -1522,27 +1491,21 @@
       history.replaceState(null, '', u);
     } catch (e) { /* file:// quirks — fine */ }
 
-    if (joined) tryJoin(); else becomeHost();
+    claimSlot(0);
+    setInterval(() => { if (peer && peer.open && mySlot >= 0) dialOthers(peer); }, 8000);
 
     setInterval(() => {
-      const msg = {
+      broadcast({
         t: 'p',
         x: +player.position.x.toFixed(2),
         y: +player.position.y.toFixed(2),
         z: +player.position.z.toFixed(2),
         h: +heading.toFixed(3),
         a: netAnim
-      };
-      if (isHost) broadcast(null, Object.assign({ id: 'H' }, msg));
-      else if (hostConn && hostConn.open) hostConn.send(msg);
+      });
     }, 80);
 
-    net = {
-      sendOrb(i) {
-        if (isHost) broadcast(null, { t: 'orb', i });
-        else if (hostConn && hostConn.open) hostConn.send({ t: 'orb', i });
-      }
-    };
+    net = { sendOrb(i) { broadcast({ t: 'orb', i }); } };
   })();
 
   // ---------- game state ----------
