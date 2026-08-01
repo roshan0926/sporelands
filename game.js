@@ -1338,8 +1338,8 @@
     if (typeof Peer === 'undefined') return; // peerjs missing — single player still works
     const params = new URLSearchParams(location.search);
     const joined = (params.get('room') || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
-    const isHost = !joined;
-    const code = isHost ? Math.random().toString(36).slice(2, 8) : joined;
+    let isHost = false;
+    const code = joined || Math.random().toString(36).slice(2, 8);
     const NAMES_A = ['Trippy', 'Glowy', 'Cosmic', 'Mellow', 'Fuzzy', 'Neon', 'Dreamy', 'Sporey'];
     const NAMES_B = ['Toad', 'Shroom', 'Wisp', 'Jelly', 'Moth', 'Fern', 'Spore', 'Crystal'];
     const myName = (params.get('name') ||
@@ -1357,6 +1357,7 @@
         d.textContent = txt;
         el.appendChild(d);
       };
+      mkRow('⋆ room ' + code + (isHost ? ' (hosting)' : ''));
       mkRow('🍄 ' + myName + ' (you)');
       for (const m of meta.values()) mkRow('🍄 ' + m.name);
     }
@@ -1437,26 +1438,37 @@
       }
     }
 
-    const peer = new Peer(isHost ? 'sporelands-' + code : undefined, { debug: 0 });
-    peer.on('open', () => {
-      if (isHost) {
-        toast('world open — click invite to bring a friend');
-      } else {
-        const conn = peer.connect('sporelands-' + code);
-        hostConn = conn;
-        conn.on('open', () => conn.send({ t: 'hello', name: myName, hue: myHue }));
-        conn.on('data', m => handleMsg('H', m, conn));
-        conn.on('close', () => {
-          toast('host disconnected 😢');
-          for (const id of [...remotes.keys()]) removePlayer(id);
-        });
+    // first one into a room claims it as host; everyone after joins them.
+    let peer = null;
+
+    function resetPeer() {
+      if (peer) { try { peer.destroy(); } catch (e) { /* already dead */ } peer = null; }
+    }
+    function cleanupRemotes() {
+      for (const id of [...remotes.keys()]) removePlayer(id);
+      conns.clear();
+      hostConn = null;
+    }
+    function handlePeerError(err) {
+      if (err.type !== 'peer-unavailable' && err.type !== 'unavailable-id' && err.type !== 'disconnected') {
+        toast('network hiccup: ' + err.type);
       }
-    });
-    if (isHost) {
-      peer.on('connection', (conn) => {
+    }
+
+    function becomeHost() {
+      resetPeer();
+      cleanupRemotes();
+      isHost = true;
+      updateRoster();
+      const p = new Peer('sporelands-' + code, { debug: 0 });
+      peer = p;
+      p.on('open', () => toast('hosting room ' + code + ' — invite a friend!'));
+      p.on('connection', (conn) => {
+        if (peer !== p) return;
         conn.on('open', () => conns.set(conn.peer, conn));
         conn.on('data', m => handleMsg(conn.peer, m, conn));
         conn.on('close', () => {
+          if (peer !== p) return;
           if (conns.has(conn.peer)) {
             conns.delete(conn.peer);
             removePlayer(conn.peer);
@@ -1464,12 +1476,53 @@
           }
         });
       });
+      p.on('error', (err) => {
+        if (peer !== p) return;
+        if (err.type === 'unavailable-id') {
+          // someone else claimed this room first — join them instead
+          tryJoin();
+        } else handlePeerError(err);
+      });
     }
-    peer.on('error', (err) => {
-      if (err.type === 'peer-unavailable') toast("couldn't find that world — is your friend online?");
-      else if (err.type === 'unavailable-id') toast('room clash — reload for a fresh room');
-      else if (err.type !== 'disconnected') toast('network hiccup: ' + err.type);
-    });
+
+    function tryJoin() {
+      resetPeer();
+      cleanupRemotes();
+      isHost = false;
+      updateRoster();
+      const p = new Peer(undefined, { debug: 0 });
+      peer = p;
+      p.on('open', () => {
+        if (peer !== p) return;
+        const conn = p.connect('sporelands-' + code);
+        hostConn = conn;
+        conn.on('open', () => conn.send({ t: 'hello', name: myName, hue: myHue }));
+        conn.on('data', m => handleMsg('H', m, conn));
+        conn.on('close', () => {
+          if (peer !== p) return;
+          toast('host disconnected — reconnecting…');
+          cleanupRemotes();
+          setTimeout(() => { if (peer === p) tryJoin(); }, 2500);
+        });
+      });
+      p.on('error', (err) => {
+        if (peer !== p) return;
+        if (err.type === 'peer-unavailable') {
+          // nobody hosting this room right now — claim it
+          toast('room was empty — you are hosting it now');
+          becomeHost();
+        } else handlePeerError(err);
+      });
+    }
+
+    // keep the room code in the URL so reloads and re-shares stay in the same room
+    try {
+      const u = new URL(location.href);
+      u.searchParams.set('room', code);
+      history.replaceState(null, '', u);
+    } catch (e) { /* file:// quirks — fine */ }
+
+    if (joined) tryJoin(); else becomeHost();
 
     setInterval(() => {
       const msg = {
@@ -1518,8 +1571,8 @@
 
     // --- movement (camera-relative) ---
     let ix = 0, iz = 0;
-    if (keys.KeyW || keys.ArrowUp) iz -= 1;
-    if (keys.KeyS || keys.ArrowDown) iz += 1;
+    if (keys.KeyW || keys.ArrowUp) iz += 1;
+    if (keys.KeyS || keys.ArrowDown) iz -= 1;
     if (keys.KeyA || keys.ArrowLeft) ix -= 1;
     if (keys.KeyD || keys.ArrowRight) ix += 1;
     const moving = ix !== 0 || iz !== 0;
