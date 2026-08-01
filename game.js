@@ -1334,20 +1334,16 @@
     setTimeout(() => el.remove(), 5200);
   }
 
-  (function initNet() {
-    if (typeof Peer === 'undefined') return; // peerjs missing — single player still works
+  function initNet(T) {
     const params = new URLSearchParams(location.search);
     const joined = (params.get('room') || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
     const code = joined || Math.random().toString(36).slice(2, 8);
-    let mySlot = -1;
-    const MAX_SLOTS = 8;
     const NAMES_A = ['Trippy', 'Glowy', 'Cosmic', 'Mellow', 'Fuzzy', 'Neon', 'Dreamy', 'Sporey'];
     const NAMES_B = ['Toad', 'Shroom', 'Wisp', 'Jelly', 'Moth', 'Fern', 'Spore', 'Crystal'];
     const myName = (params.get('name') ||
       (NAMES_A[Math.floor(Math.random() * NAMES_A.length)] + ' ' + NAMES_B[Math.floor(Math.random() * NAMES_B.length)])).slice(0, 16);
     const myHue = Math.random();
     const meta = new Map();   // id -> {name, hue}
-    const conns = new Map();  // id -> DataConnection
 
     function updateRoster() {
       const el = document.getElementById('players');
@@ -1357,7 +1353,7 @@
         d.textContent = txt;
         el.appendChild(d);
       };
-      mkRow('⋆ room ' + code + (mySlot >= 0 ? '' : ' — connecting…'));
+      mkRow('⋆ room ' + code);
       mkRow('🍄 ' + myName + ' (you)');
       for (const m of meta.values()) mkRow('🍄 ' + m.name);
     }
@@ -1394,95 +1390,49 @@
       if (m) toast(m.name + ' left');
       updateRoster();
     }
-    function broadcast(msg) {
-      for (const c of conns.values()) if (c.open) c.send(msg);
-    }
-    function handleMsg(fromId, msg) {
-      if (!msg || typeof msg !== 'object') return;
-      switch (msg.t) {
-        case 'hello':
-          addPlayer(fromId, msg.name, msg.hue);
-          (msg.orbs || []).forEach((tk, i) => { if (tk) collectOrb(i, true); });
-          break;
-        case 'p': {
-          const av = remotes.get(fromId);
-          if (av) {
-            av.target.set(+msg.x || 0, +msg.y || 0, +msg.z || 0);
-            av.targetH = +msg.h || 0;
-            av.setAnim(msg.a === 'Run' ? 'Run' : msg.a === 'Walk' ? 'Walk' : 'Idle');
-          }
-          break;
+    // trystero mesh: signaling over redundant public nostr relays, then direct WebRTC.
+    // STUN + free TURN relays cover strict NATs.
+    let room;
+    try {
+      room = T.joinRoom({
+        appId: 'sporelands-mmxxvi',
+        rtcConfig: {
+          iceServers: [
+            { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+            { urls: 'turn:staticauth.openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+            { urls: 'turn:staticauth.openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+          ]
         }
-        case 'orb':
-          collectOrb(msg.i | 0, true);
-          break;
+      }, code);
+    } catch (e) {
+      toast('multiplayer unavailable — single player mode');
+      return;
+    }
+
+    const [sendHello, onHello] = room.makeAction('hello');
+    const [sendState, onState] = room.makeAction('state');
+    const [sendOrbMsg, onOrbMsg] = room.makeAction('orb');
+
+    room.onPeerJoin((id) => {
+      // introduce ourselves (and the current orb state) to the newcomer
+      try { sendHello({ name: myName, hue: myHue, orbs: orbs.map(o => o.taken) }, id); } catch (e) {}
+    });
+    room.onPeerLeave((id) => removePlayer(id));
+    onHello((d, id) => {
+      if (!d) return;
+      addPlayer(id, d.name, d.hue);
+      (d.orbs || []).forEach((tk, i) => { if (tk) collectOrb(i, true); });
+    });
+    onState((d, id) => {
+      if (!d) return;
+      const av = remotes.get(id);
+      if (av) {
+        av.target.set(+d.x || 0, +d.y || 0, +d.z || 0);
+        av.targetH = +d.h || 0;
+        av.setAnim(d.a === 'Run' ? 'Run' : d.a === 'Walk' ? 'Walk' : 'Idle');
       }
-    }
-
-    // full mesh: everyone claims a numbered slot in the room and dials every other slot.
-    // no host, so there is nothing to lose or race — a periodic rescan heals any gaps.
-    let peer = null;
-
-    function handlePeerError(err) {
-      if (err.type !== 'peer-unavailable' && err.type !== 'unavailable-id' && err.type !== 'disconnected') {
-        toast('network hiccup: ' + err.type);
-      }
-    }
-
-    function slotId(k) { return 'sporelands-' + code + '-' + k; }
-
-    function wire(pInst, conn, outgoing) {
-      const rid = conn.peer;
-      conn.on('open', () => {
-        if (peer !== pInst) { try { conn.close(); } catch (e) {} return; }
-        const existing = conns.get(rid);
-        if (existing && existing !== conn) {
-          // both sides dialed at once — keep the channel dialed by the lower slot id
-          const keepThis = outgoing ? pInst.id < rid : pInst.id > rid;
-          if (!keepThis) { try { conn.close(); } catch (e) {} return; }
-          try { existing.close(); } catch (e) {}
-        }
-        conns.set(rid, conn);
-        conn.send({ t: 'hello', name: myName, hue: myHue, orbs: orbs.map(o => o.taken) });
-      });
-      conn.on('data', (m) => { if (peer === pInst) handleMsg(rid, m); });
-      conn.on('close', () => {
-        if (peer === pInst && conns.get(rid) === conn) {
-          conns.delete(rid);
-          removePlayer(rid);
-        }
-      });
-    }
-
-    function dialOthers(pInst) {
-      for (let s = 0; s < MAX_SLOTS; s++) {
-        if (s === mySlot) continue;
-        const rid = slotId(s);
-        if (conns.has(rid)) continue;
-        wire(pInst, pInst.connect(rid), true);
-      }
-    }
-
-    function claimSlot(k) {
-      if (k >= MAX_SLOTS) { toast('room is full (' + MAX_SLOTS + ' players)'); return; }
-      if (peer) { try { peer.destroy(); } catch (e) {} }
-      const p = new Peer(slotId(k), { debug: 0 });
-      peer = p;
-      p.on('open', () => {
-        if (peer !== p) return;
-        mySlot = k;
-        updateRoster();
-        toast('room ' + code + ' — connected ✨');
-        dialOthers(p);
-      });
-      p.on('connection', (conn) => { if (peer === p) wire(p, conn, false); });
-      p.on('disconnected', () => { if (peer === p) { try { p.reconnect(); } catch (e) {} } });
-      p.on('error', (err) => {
-        if (peer !== p) return;
-        if (err.type === 'unavailable-id') claimSlot(k + 1); // slot taken, try the next
-        else handlePeerError(err);
-      });
-    }
+    });
+    onOrbMsg((d) => { if (d) collectOrb(d.i | 0, true); });
 
     // keep the room code in the URL so reloads and re-shares stay in the same room
     try {
@@ -1491,22 +1441,32 @@
       history.replaceState(null, '', u);
     } catch (e) { /* file:// quirks — fine */ }
 
-    claimSlot(0);
-    setInterval(() => { if (peer && peer.open && mySlot >= 0) dialOthers(peer); }, 8000);
+    toast('room ' + code + ' open — invite a friend ✨');
 
     setInterval(() => {
-      broadcast({
-        t: 'p',
-        x: +player.position.x.toFixed(2),
-        y: +player.position.y.toFixed(2),
-        z: +player.position.z.toFixed(2),
-        h: +heading.toFixed(3),
-        a: netAnim
-      });
+      try {
+        if (Object.keys(room.getPeers()).length === 0) return;
+        sendState({
+          x: +player.position.x.toFixed(2),
+          y: +player.position.y.toFixed(2),
+          z: +player.position.z.toFixed(2),
+          h: +heading.toFixed(3),
+          a: netAnim
+        });
+      } catch (e) { /* transient send failures are fine at 12.5Hz */ }
     }, 80);
 
-    net = { sendOrb(i) { broadcast({ t: 'orb', i }); } };
-  })();
+    net = { sendOrb(i) { try { sendOrbMsg({ i }); } catch (e) {} } };
+  }
+
+  (function waitNet(tries) {
+    const p = window.__net;
+    if (!p || typeof p.then !== 'function') {
+      if (tries < 100) setTimeout(() => waitNet(tries + 1), 100);
+      return;
+    }
+    p.then((mod) => { if (mod && mod.joinRoom) initNet(mod); }).catch(() => {});
+  })(0);
 
   // ---------- game state ----------
   const vel = new THREE.Vector3();
