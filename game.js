@@ -1334,7 +1334,8 @@
     setTimeout(() => el.remove(), 5200);
   }
 
-  function initNet(T) {
+  function initNet() {
+    if (typeof mqtt === 'undefined') return; // lib missing — single player still works
     const params = new URLSearchParams(location.search);
     const joined = (params.get('room') || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
     const code = joined || Math.random().toString(36).slice(2, 8);
@@ -1377,7 +1378,7 @@
       if (remotes.has(id)) return;
       name = String(name || 'Explorer').slice(0, 16);
       hue = +hue || 0;
-      meta.set(id, { name, hue });
+      meta.set(id, { name, hue, lastSeen: performance.now() });
       remotes.set(id, createRemoteAvatar(name, hue));
       toast(name + ' joined 🌈');
       updateRoster();
@@ -1390,49 +1391,102 @@
       if (m) toast(m.name + ' left');
       updateRoster();
     }
-    // trystero mesh: signaling over redundant public nostr relays, then direct WebRTC.
-    // STUN + free TURN relays cover strict NATs.
-    let room;
-    try {
-      room = T.joinRoom({
-        appId: 'sporelands-mmxxvi',
-        rtcConfig: {
-          iceServers: [
-            { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-            { urls: 'turn:staticauth.openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-            { urls: 'turn:staticauth.openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
-          ]
-        }
-      }, code);
-    } catch (e) {
-      toast('multiplayer unavailable — single player mode');
-      return;
+    // all realtime traffic relays through a public MQTT broker over WebSocket.
+    // no WebRTC, no NAT traversal, no discovery handshake — if the broker is
+    // reachable (verified transport), players in the same room see each other.
+    const myId = Math.random().toString(36).slice(2, 10);
+    const base = 'sporelands/' + code;
+    const BROKERS = [
+      'wss://broker.emqx.io:8084/mqtt',
+      'wss://broker.hivemq.com:8884/mqtt',
+      'wss://test.mosquitto.org:8081'
+    ];
+    let client = null;
+    let brokerIdx = 0;
+    let announced = false;
+
+    function orbMask() {
+      let k = 0;
+      for (let i = 0; i < orbs.length; i++) if (orbs[i].taken) k |= (1 << i);
+      return k;
     }
 
-    const [sendHello, onHello] = room.makeAction('hello');
-    const [sendState, onState] = room.makeAction('state');
-    const [sendOrbMsg, onOrbMsg] = room.makeAction('orb');
+    function connectBroker() {
+      if (brokerIdx >= BROKERS.length) { toast('multiplayer offline — no broker reachable'); return; }
+      const c = mqtt.connect(BROKERS[brokerIdx], {
+        clientId: 'spore_' + myId,
+        keepalive: 30,
+        reconnectPeriod: 3000,
+        connectTimeout: 8000,
+        will: { topic: base + '/bye/' + myId, payload: '1', qos: 0, retain: false }
+      });
+      client = c;
+      let everConnected = false;
+      c.on('connect', () => {
+        everConnected = true;
+        c.subscribe(base + '/s/#');
+        c.subscribe(base + '/bye/#');
+        if (!announced) { announced = true; toast('room ' + code + ' — online ✨'); }
+      });
+      c.on('message', (topic, payload) => {
+        const parts = topic.split('/');
+        const kind = parts[2], id = parts[3];
+        if (!id || id === myId) return;
+        if (kind === 'bye') { removePlayer(id); return; }
+        if (kind !== 's') return;
+        let d;
+        try { d = JSON.parse(payload.toString()); } catch (e) { return; }
+        if (!remotes.has(id)) addPlayer(id, d.n, d.u);
+        const m = meta.get(id);
+        if (m) m.lastSeen = performance.now();
+        const av = remotes.get(id);
+        if (av) {
+          av.target.set(+d.x || 0, +d.y || 0, +d.z || 0);
+          av.targetH = +d.h || 0;
+          av.setAnim(d.a === 'Run' ? 'Run' : d.a === 'Walk' ? 'Walk' : 'Idle');
+        }
+        const k = d.k | 0; // orb bitmask piggybacked on every state message
+        if (k) for (let i = 0; i < orbs.length; i++) if ((k >>> i) & 1) collectOrb(i, true);
+      });
+      c.on('error', () => { /* reconnectPeriod handles retries */ });
+      setTimeout(() => {
+        if (!everConnected) {
+          try { c.end(true); } catch (e) {}
+          brokerIdx++;
+          connectBroker();
+        }
+      }, 9000);
+    }
+    connectBroker();
 
-    room.onPeerJoin((id) => {
-      // introduce ourselves (and the current orb state) to the newcomer
-      try { sendHello({ name: myName, hue: myHue, orbs: orbs.map(o => o.taken) }, id); } catch (e) {}
-    });
-    room.onPeerLeave((id) => removePlayer(id));
-    onHello((d, id) => {
-      if (!d) return;
-      addPlayer(id, d.name, d.hue);
-      (d.orbs || []).forEach((tk, i) => { if (tk) collectOrb(i, true); });
-    });
-    onState((d, id) => {
-      if (!d) return;
-      const av = remotes.get(id);
-      if (av) {
-        av.target.set(+d.x || 0, +d.y || 0, +d.z || 0);
-        av.targetH = +d.h || 0;
-        av.setAnim(d.a === 'Run' ? 'Run' : d.a === 'Walk' ? 'Walk' : 'Idle');
+    // 10Hz state publish (also carries name/hue so no join handshake is needed)
+    setInterval(() => {
+      if (!client || !client.connected) return;
+      client.publish(base + '/s/' + myId, JSON.stringify({
+        n: myName, u: +myHue.toFixed(3),
+        x: +player.position.x.toFixed(2),
+        y: +player.position.y.toFixed(2),
+        z: +player.position.z.toFixed(2),
+        h: +heading.toFixed(3),
+        a: netAnim,
+        k: orbMask()
+      }));
+    }, 100);
+
+    // sweep peers that went silent (crashed / lost connection without a will)
+    setInterval(() => {
+      const now = performance.now();
+      for (const [id, m] of [...meta]) {
+        if (now - (m.lastSeen || 0) > 20000) removePlayer(id);
       }
+    }, 2000);
+
+    addEventListener('beforeunload', () => {
+      try {
+        if (client && client.connected) client.publish(base + '/bye/' + myId, '1');
+        if (client) client.end(true);
+      } catch (e) {}
     });
-    onOrbMsg((d) => { if (d) collectOrb(d.i | 0, true); });
 
     // keep the room code in the URL so reloads and re-shares stay in the same room
     try {
@@ -1441,32 +1495,10 @@
       history.replaceState(null, '', u);
     } catch (e) { /* file:// quirks — fine */ }
 
-    toast('room ' + code + ' open — invite a friend ✨');
-
-    setInterval(() => {
-      try {
-        if (Object.keys(room.getPeers()).length === 0) return;
-        sendState({
-          x: +player.position.x.toFixed(2),
-          y: +player.position.y.toFixed(2),
-          z: +player.position.z.toFixed(2),
-          h: +heading.toFixed(3),
-          a: netAnim
-        });
-      } catch (e) { /* transient send failures are fine at 12.5Hz */ }
-    }, 80);
-
-    net = { sendOrb(i) { try { sendOrbMsg({ i }); } catch (e) {} } };
+    // orb pickups ride the orbMask in the next state publish (≤100ms later)
+    net = { sendOrb() {} };
   }
-
-  (function waitNet(tries) {
-    const p = window.__net;
-    if (!p || typeof p.then !== 'function') {
-      if (tries < 100) setTimeout(() => waitNet(tries + 1), 100);
-      return;
-    }
-    p.then((mod) => { if (mod && mod.joinRoom) initNet(mod); }).catch(() => {});
-  })(0);
+  initNet();
 
   // ---------- game state ----------
   const vel = new THREE.Vector3();
