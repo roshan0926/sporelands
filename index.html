@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SPORELANDS 🍄</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #0b0416; height: 100%; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; inset: 0; pointer-events: none;
+    font-family: "Avenir Next", Futura, "Trebuchet MS", sans-serif;
+    color: #fff; user-select: none;
+  }
+  #title {
+    position: absolute; top: 18px; left: 24px;
+    font-size: 28px; font-weight: 800; letter-spacing: 6px;
+    background: linear-gradient(90deg, #ff6ec7, #ffd166, #6effc7, #6e9bff, #ff6ec7);
+    background-size: 400% 100%;
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    animation: hueflow 8s linear infinite;
+    text-shadow: none;
+  }
+  @keyframes hueflow { to { background-position: 400% 0; } }
+  #spores {
+    position: absolute; top: 22px; right: 26px;
+    font-size: 20px; font-weight: 700; letter-spacing: 1px;
+    color: #eaffff; text-shadow: 0 0 12px #7df9ff, 0 0 30px #b26eff;
+  }
+  #hint {
+    position: absolute; bottom: 26px; left: 50%; transform: translateX(-50%);
+    text-align: center; font-size: 15px; line-height: 1.7; letter-spacing: 1px;
+    color: #d9c9ff; text-shadow: 0 0 10px #6b2fb3;
+    background: rgba(20, 6, 40, 0.45); border: 1px solid rgba(180, 120, 255, 0.35);
+    border-radius: 14px; padding: 10px 22px; backdrop-filter: blur(4px);
+    transition: opacity 1.5s;
+  }
+  #message {
+    position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%);
+    font-size: 34px; font-weight: 800; letter-spacing: 4px; text-align: center;
+    color: #fff; text-shadow: 0 0 20px #ff6ec7, 0 0 60px #7df9ff;
+    opacity: 0; transition: opacity 2s;
+  }
+  #invite {
+    position: absolute; top: 62px; right: 26px;
+    pointer-events: auto; cursor: pointer;
+    font-size: 14px; font-weight: 700; letter-spacing: 1px; color: #eaffff;
+    background: rgba(30, 10, 60, 0.6); border: 1px solid rgba(140, 240, 255, 0.45);
+    border-radius: 12px; padding: 8px 16px; backdrop-filter: blur(4px);
+    text-shadow: 0 0 10px #7df9ff;
+    transition: background 0.2s, transform 0.1s;
+  }
+  #invite:hover { background: rgba(60, 25, 110, 0.75); transform: scale(1.04); }
+  #players {
+    position: absolute; bottom: 10px; left: 14px;
+    font-size: 12px; letter-spacing: 1px; line-height: 1.8;
+    color: rgba(216, 190, 255, 0.8); text-shadow: 0 0 8px #4a1a80;
+  }
+  #toasts {
+    position: absolute; top: 112px; right: 26px;
+    display: flex; flex-direction: column; gap: 6px; align-items: flex-end;
+  }
+  .toast {
+    font-size: 13px; letter-spacing: 1px; color: #ffe9ff;
+    background: rgba(40, 12, 70, 0.7); border: 1px solid rgba(255, 140, 230, 0.35);
+    border-radius: 10px; padding: 6px 14px;
+    animation: toastfade 5s forwards;
+  }
+  @keyframes toastfade { 0% { opacity: 0; transform: translateX(20px); } 8% { opacity: 1; transform: none; } 80% { opacity: 1; } 100% { opacity: 0; } }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div id="title">SPORELANDS</div>
+  <div id="spores">✦ spores: <span id="sporeCount">0</span> / <span id="sporeTotal">0</span></div>
+  <div id="hint">
+    <b>W A S D</b> run &nbsp;·&nbsp; <b>SHIFT</b> sprint &nbsp;·&nbsp; <b>SPACE</b> jump<br>
+    click the world to look around &nbsp;·&nbsp; collect the glowing spores
+  </div>
+  <div id="message"></div>
+  <div id="invite">🔗 invite a friend</div>
+  <div id="players"></div>
+  <div id="toasts"></div>
+</div>
+<canvas id="c"></canvas>
+<script src="three.min.js"></script>
+<script src="lib/Pass.js"></script>
+<script src="lib/MaskPass.js"></script>
+<script src="lib/CopyShader.js"></script>
+<script src="lib/LuminosityHighPassShader.js"></script>
+<script src="lib/EffectComposer.js"></script>
+<script src="lib/RenderPass.js"></script>
+<script src="lib/ShaderPass.js"></script>
+<script src="lib/UnrealBloomPass.js"></script>
+<script src="lib/GLTFLoader.js"></script>
+<script src="lib/SkeletonUtils.js"></script>
+<script src="lib/peerjs.min.js"></script>
+<script src="game.js"></script>
+</body>
+</html>
